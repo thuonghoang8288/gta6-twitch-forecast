@@ -7,6 +7,14 @@ Method (validated by leave-one-out over the kit's comparables):
     hour1 / day-peak >= 0.20); single-global-unlock launches whose hour 1 is
     near zero are excluded, because their hour-1 ratios explode and would
     wreck the spread.
+  - Donors are weighted by hour-1 scale similarity: a donor whose hour-1
+    print is close to this case's hour-1 print weighs more
+    (w = 1 / (1 + |log(donor_h1 / p1)|)), because launches of a similar size
+    follow a more similar day curve than launches an order of magnitude
+    apart. The centre and spread are the weighted mean / weighted sd of the
+    log-ratios. (Revision: the unweighted mean scored 0.2196 LOO; weighting
+    improves it to 0.2127, and also helps on looser donor selections:
+    0.2366 -> 0.2252 at threshold 0.15, 0.3072 -> 0.2902 at 0.05.)
   - For each forecast hour h, take the log-ratio log(viewers_h / viewers_1)
     across donors. The median forecast is p1 * exp(0.9 * mean(log-ratio)):
     the 0.9 shrink guards against the donor median overshooting.
@@ -16,14 +24,14 @@ Method (validated by leave-one-out over the kit's comparables):
     passes the filter.
 
 Local validation (LOO over 24 rolling comparables, mean pinball loss):
-  this model 0.2196 vs house baseline 0.2652 on the same cases.
+  this model 0.2127 vs house baseline 0.2652 on the same cases
+  (unweighted version: 0.2196; wins vs baseline 21/24).
 Standard library only; deterministic; no network.
 """
 
 import json
 import math
 import os
-import statistics
 import sys
 from pathlib import Path
 
@@ -118,9 +126,21 @@ def forecast_case(case: dict, name: str) -> dict:
         if not donors:
             q = baseline_quantiles(p1, h)
         else:
-            logs = sorted(math.log(c[h - 1] / c[0]) for c in donors)
-            m = statistics.mean(logs) * SHRINK
-            s = statistics.pstdev(logs) if len(logs) > 1 else SD_MIN
+            # Weight each donor by how close its hour-1 scale is to this case's
+            # hour-1 print: launches of a similar size follow a more similar
+            # day curve than launches an order of magnitude apart.
+            # w = 1 / (1 + |log(donor_h1 / p1)|), so a donor at the same scale
+            # weighs 1 and one 10x away weighs ~0.30.
+            pairs = [(c[0], math.log(c[h - 1] / c[0])) for c in donors]
+            weights = [1.0 / (1.0 + abs(math.log(h1 / p1))) for h1, _ in pairs]
+            wsum = sum(weights)
+            mu = sum(w * v for w, (_, v) in zip(weights, pairs)) / wsum
+            m = mu * SHRINK
+            if len(pairs) > 1:
+                var = sum(w * (v - mu) ** 2 for w, (_, v) in zip(weights, pairs)) / wsum
+                s = math.sqrt(var)
+            else:
+                s = SD_MIN
             s = max(SD_MIN, min(SD_MAX, s))
             q = [round2(min(1e9, max(1.0, p1 * math.exp(m + z * s)))) for z in Z]
             # Keep the row non-decreasing after rounding.
